@@ -83,6 +83,10 @@ class CheckoutRequest(BaseModel):
     provider: str = "stripe"  # stripe or paypal
 
 
+class UpdateStatus(BaseModel):
+    status: str
+
+
 # ---------------------------- Root & Health --------------------------------
 @app.get("/")
 def read_root():
@@ -197,6 +201,22 @@ def update_product(product_id: str, product: ProductIn):
     return {"updated": True}
 
 
+@app.put("/api/seller/products/{product_id}/status")
+def update_product_status(product_id: str, body: UpdateStatus):
+    if body.status not in ("active", "suspended"):
+        raise HTTPException(status_code=400, detail="Invalid status")
+    result = db.product.update_one({"_id": oid(product_id)}, {"$set": {"status": body.status}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Product not found")
+    create_document("auditlog", {
+        "action": "update_product_status",
+        "resource_type": "product",
+        "resource_id": product_id,
+        "metadata": {"status": body.status}
+    })
+    return {"updated": True}
+
+
 @app.delete("/api/seller/products/{product_id}")
 def delete_product(product_id: str):
     result = db.product.delete_one({"_id": oid(product_id)})
@@ -208,6 +228,14 @@ def delete_product(product_id: str):
         "resource_id": product_id
     })
     return {"deleted": True}
+
+
+@app.get("/api/seller/products")
+def list_seller_products(seller_id: str):
+    docs = list(db.product.find({"seller_id": seller_id}).sort("created_at", -1))
+    for d in docs:
+        d["id"] = str(d.pop("_id"))
+    return {"products": docs}
 
 
 @app.get("/api/seller/analytics")
@@ -234,6 +262,43 @@ def seller_analytics(seller_id: str):
         "sales": base.get("sales", 0),
         "conversion_rate": round(conv, 2)
     }
+
+
+@app.get("/api/seller/analytics/top-products")
+def seller_top_products(seller_id: str, limit: int = 10):
+    docs = list(db.product.find({"seller_id": seller_id}).sort([("stats.sales", -1), ("stats.views", -1)]).limit(limit))
+    items = []
+    for d in docs:
+        items.append({
+            "id": str(d.get("_id")),
+            "title": d.get("title"),
+            "sales": d.get("stats", {}).get("sales", 0),
+            "views": d.get("stats", {}).get("views", 0),
+            "status": d.get("status", "active"),
+            "price": d.get("price", 0),
+            "currency": d.get("currency", "usd"),
+            "category": d.get("category")
+        })
+    return {"top": items}
+
+
+@app.get("/api/seller/analytics/recent-sales")
+def seller_recent_sales(seller_id: str, limit: int = 20):
+    # find purchases that include this seller's items
+    purchases = list(db.purchase.find({"items.seller_id": seller_id, "payment_status": "paid"}).sort("created_at", -1).limit(limit))
+    rows = []
+    for p in purchases:
+        for it in p.get("items", []):
+            if it.get("seller_id") == seller_id:
+                rows.append({
+                    "purchase_id": str(p.get("_id")),
+                    "buyer_email": p.get("buyer_email"),
+                    "title": it.get("title"),
+                    "product_id": it.get("product_id"),
+                    "price": it.get("price"),
+                    "currency": p.get("currency", "usd"),
+                })
+    return {"sales": rows[:limit]}
 
 
 @app.get("/api/seller/payouts")
